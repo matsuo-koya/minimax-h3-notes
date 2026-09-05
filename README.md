@@ -30,7 +30,7 @@ A 7.6 s reference-driven lip-sync segment went 127 s → **69 s**.
 | 5 | width 1280 → 1216 | VAE decode tiles 28→24, total **−15 %** | ours |
 | 6 | pull-based distributed segment queue (5090 + 4090) | 28-segment MV 3.8 h → 2.7 h; grouping same-kind jobs per worker keeps model swap cost at 55 s instead of 210 s | ours (design) |
 | 7 | the 345-frame cliff on the 4090 | 6 of 7 runs 3–17× slower; 328 f is stable (11 runs within 1.7 %). Not VRAM — memory lines identical; time is lost *outside* sampling. Cap set to 328 | ours (and a lesson: never set a limit from n=1) |
-| 8 | Zironic H3-Optimizations `H3MemoryOptimization` | 1.27× (134→106 s), but **output is no longer bit-exact** (mean pixel diff 2.27/255, undocumented) and it **fails on GGUF** (`3024x14336` = Q4_K_M container shape read as the weight shape) | node: Zironic / **findings: ours** |
+| 8 | Zironic H3-Optimizations `H3MemoryOptimization` | 1.27× (134→106 s), but **output no longer matches the plain model at the same seed** (mean pixel diff 2.27/255, undocumented; run-to-run reproducibility *with* the node was not measured) and it **fails on GGUF** (`3024x14336` = Q4_K_M container shape read as the weight shape) | node: Zironic / **findings: ours** |
 | 9 | ToneCompensate (seam colour correction) | measured bias < 1/255 and not even consistent in sign → not needed here | negative result |
 | 10 | Sage attention / FastVideo VSA / 148 GB full model | no nvcc here; VSA needs its own kernel + CUDA 13 + B200 | not usable |
 | 11 | alibaba-pai Acc-LoRAs | not LoRAs: PDD weights (`pdd_num_steps: 32`, `proj_out (32, 96, 5376)`) — needs a PDD sampler ComfyUI doesn't have | not usable |
@@ -44,11 +44,12 @@ the LoRA just half-works: style transfers, identity doesn't, higher strength col
 The fused `qkv` needs a block-diagonal `lora_B`. Both mappings were verified bit-exact against a LoRA that
 lightx2v ships in both formats (416/416 tensors). The `adaln` family cannot be mapped onto the pruned
 checkpoints (they fold the time embedding into a `[1025, 8]` table) and is dropped — with no visible
-quality cost. Tool: [`tools/h3_lora_convert.py`](tools/h3_lora_convert.py) (`--compare` reproduces the check).
+quality cost in our reference-driven tests (3 seeds, 124 f); that is an observation, not a proof that
+dropping it is harmless in general. Tool: [`tools/h3_lora_convert.py`](tools/h3_lora_convert.py) (`--compare` reproduces the check).
 
-**FastH3's transformer blocks are identical to H3's.** While checking the int8 ConvRot conversion,
-"H3 vs FastH3" differences matched the int8 quantization error to three decimals on all ten blocks tested.
-The 4-step distillation lives only in the `adaln` weights (`[96768, 2688]` full vs `[96768, 8]` pruned).
+**FastH3's transformer blocks look identical to H3's.** While checking the int8 ConvRot conversion,
+"H3 vs FastH3" differences matched the int8 quantization error to three decimals on all ten blocks tested
+(of 50; the rest were not checked). As far as tested, the 4-step distillation lives only in the `adaln` weights (`[96768, 2688]` full vs `[96768, 8]` pruned).
 The pruned table satisfies `z(i) = B · silu(temb(t))` with residual 2.4e-6 (`i/1024 = t`), so an adaln
 LoRA trained on the pruned model can be lifted to full rank with `ΔW_full = ΔW_pruned @ Z @ pinv(C)`.
 
@@ -57,9 +58,19 @@ LoRA trained on the pruned model can be lifted to full rank with `ΔW_full = ΔW
 - `tools/h3_lora_convert.py` — diffusers → ComfyUI LoRA converter for H3 (needs `torch`, `safetensors`).
   `python h3_lora_convert.py in.safetensors out.safetensors --model minimax_h3_....safetensors`
   checks every tensor against the checkpoint header (reads only the header, not the 21 GB).
+  It fails closed: incomplete `qkv` triples, A/B rank mismatches, non-finite values, unknown
+  suffixes, shapes that don't match the checkpoint, and `.alpha` keys (it has no way to know
+  what scale the trainer meant — FastH3 and lightx2v ship none) all give exit 1 and no output file.
+  `--compare ref.safetensors` demands an exact tensor-by-tensor match, including shapes.
 - `tools/profile_nodes.py` — per-node timing from ComfyUI's websocket `executing` events
   (`/history` only gives you the total). Needs `aiohttp`.
   `python profile_nodes.py workflow_api.json --label "t2v 1280x704"`
+  Events from other jobs are ignored; an error, interruption or truncated stream gives exit 1
+  instead of a summary.
+- `tests/test_review.py` — CPU-only tests for both tools (synthetic safetensors, fake websocket).
+  `python -m pytest tests -q`. They started life as an external review harness that reproduced
+  nine real defects in the first published version (2026-09-06); the history of that is in the
+  file's docstring.
 
 ## Measurement rules we had to learn the hard way
 
