@@ -43,6 +43,7 @@ def import_file(name):
 
 conv = import_file('h3_lora_convert')
 prof = import_file('profile_nodes')
+reb = import_file('h3_adaln_rebase')
 
 
 def save(tmp_path, name, tensors):
@@ -180,6 +181,58 @@ def test_compare_exact_match_succeeds(tmp_path, monkeypatch):
     p = save(tmp_path, 'input.safetensors', {'proj_in.diff': torch.ones(2, 2)})
     ref = save(tmp_path, 'ref.safetensors', {'diffusion_model.video_patch_proj.diff': torch.ones(2, 2)})
     assert cli(monkeypatch, p, '--compare', ref) == 0
+
+
+# ------------------------------------------------------------- adaln rebase
+
+def tiny_h3(tmp_path, table_noise=0.0, rows=10, grid=33, hidden=16, tdim=8):
+    # A pruned/full pair that is consistent by construction: with tdim == 8 the
+    # silu(temb) curve *is* an 8-column table, so table = curve and W_p = W_f.
+    gt = torch.Generator().manual_seed(0)
+    w1, b1 = torch.randn(hidden, 256, generator=gt) * 0.1, torch.randn(hidden, generator=gt) * 0.1
+    w2, b2 = torch.randn(tdim, hidden, generator=gt), torch.randn(tdim, generator=gt) * 0.1
+    g = torch.Generator().manual_seed(1)
+    t = torch.arange(grid, dtype=torch.float32) / (grid - 1)
+    table = reb.temb_silu(t, w1, b1, w2, b2)
+    table = table + table_noise * torch.randn(table.shape, generator=gt)
+    Wp, bp = torch.randn(rows, tdim, generator=g), torch.randn(rows, generator=g)
+    dW, db = torch.randn(rows, tdim, generator=g) * 0.01, torch.randn(rows, generator=g) * 0.01
+    pruned = {'adaln_t_table': table, 'blocks.0.adaln_proj.linear.weight': Wp, 'blocks.0.adaln_proj.linear.bias': bp,
+              'final_layer.adaln_proj.linear.weight': Wp[:2].clone(), 'final_layer.adaln_proj.linear.bias': bp[:2].clone()}
+    full = {'time_embedder.proj_in.weight': w1, 'time_embedder.proj_in.bias': b1,
+            'time_embedder.proj_out.weight': w2, 'time_embedder.proj_out.bias': b2,
+            'blocks.0.adaln_proj.linear.weight': Wp + dW, 'blocks.0.adaln_proj.linear.bias': bp + db,
+            'final_layer.adaln_proj.linear.weight': (Wp[:2] + dW[:2]).clone(), 'final_layer.adaln_proj.linear.bias': (bp[:2] + db[:2]).clone()}
+    return save(tmp_path, 'pruned.safetensors', pruned), save(tmp_path, 'full.safetensors', full), dW, db
+
+
+def test_rebase_recovers_a_representable_delta(tmp_path):
+    pruned, full, dW, db = tiny_h3(tmp_path)
+    out, stats = reb.rebase(pruned, full, max_rel_resid=1e-3, quiet=True)
+    assert stats['worst_rel_resid'] < 1e-4
+    assert torch.allclose(out['diffusion_model.blocks.0.adaln_proj.linear.diff'], dW, atol=1e-5)
+    assert torch.allclose(out['diffusion_model.blocks.0.adaln_proj.linear.diff_b'], db, atol=1e-5)
+    assert out['diffusion_model.final_layer.adaln_proj.linear.diff'].shape == (2, 8)
+
+
+def test_rebase_refuses_when_the_basis_cannot_carry_it(tmp_path):
+    # A table that was not built from the full model's time embedder cannot carry
+    # the delta; the fit must fail closed.  (Any *smooth* curve over t in [0, 1]
+    # fits an H3-style table — the sinusoid frequencies are all <= 1 rad — so a
+    # different time embedder would not trigger this; a noisy table does.)
+    pruned, full, _, _ = tiny_h3(tmp_path, table_noise=0.3)
+    with pytest.raises(SystemExit):
+        reb.rebase(pruned, full, max_rel_resid=1e-3, quiet=True)
+
+
+def test_rebase_merge_rejects_overlapping_keys(tmp_path, monkeypatch):
+    pruned, full, _, _ = tiny_h3(tmp_path)
+    lora = save(tmp_path, 'lora.safetensors', {'diffusion_model.blocks.0.adaln_proj.linear.diff': torch.zeros(10, 8)})
+    dst = str(tmp_path / 'out.safetensors')
+    monkeypatch.setattr(sys, 'argv', ['h3_adaln_rebase.py', '--pruned', pruned, '--full', full, '--out', dst, '--merge-into', lora, '--quiet'])
+    with pytest.raises(SystemExit):
+        reb.main()
+    assert not Path(dst).exists()
 
 
 # ----------------------------------------------------------------- profiler
