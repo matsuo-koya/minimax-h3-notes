@@ -24,6 +24,7 @@ RTX 5090 (32GB) + WSL2 + ComfyUI 0.33 の自作スタジオ（LaViale）で、Mi
 | 8 | H3-Optimizations の `H3MemoryOptimization` | **1.27 倍**（134→106 秒）。ただし**出力がビット一致しない**（画素差 2.27/255）。GGUF では動かない | ◇ ノード / ★ 素と不一致・GGUF 不動の発見 |
 | 9 | ToneCompensate（継ぎ目の色補正） | 偏りは **1/255 未満**・向きも揃わない → 入れない | ✗ |
 | 10 | Sage attention / VSA（FastVideo の疎アテンション）/ 148GB 本体 | nvcc 無し・B200 前提で **うちでは動かない** | ✗ |
+| 10b | NVIDIA Sol-H3（Sol-Engine, 2026-09） | few-step LoRA は **うちの fast4 と lightx2v ref2v 4step そのもの**。Sol-Attn（疎アテンション）は **1 GPU を拒否**（2/4/8 GPU 専用）。fused Norm/RoPE/SwiGLU・AdaLN 事前計算は ComfyUI 0.33 が既に持っている | ✗（新しく効くものなし） |
 | 11 | alibaba-pai Acc-LoRA（PDD） | LoRA ではなく 32 ステップ並列解法の重み。ComfyUI に PDD が無いので使えない | ✗ |
 | 12 | `/api/job` の様子見が生成を止めていた | 18〜43 秒の沈黙が消えた（生成中の ComfyUI は HTTP に応答しない） | ★ 運用 |
 | 13 | ComfyUI は壊れる前に「劣化」する | クリップが **1.8 倍**遅くなったら再起動（CUDA 崩壊の前兆） | ★ 運用 |
@@ -312,6 +313,15 @@ Zironic の `H3MemoryOptimization`（DiT → ノード → guider・scheduler）
 - **alibaba-pai Acc-LoRA**: `pdd_num_steps: 32 / pdd_block_size: 4`、`proj_out.weight → (32, 96, 5376)`。
   「8 step」は 32 ステップを 4 個ずつ並列に解く (PDD) の意味で、普通の 8 step サンプラーとは別物。
   ComfyUI に PDD を実装しないと意味が無い（`Jalen-Brunson/ComfyUI-MiniMax-H3-PDD-Acc` が出ている・未検証）
+- **NVIDIA Sol-H3 / Sol-Engine**（`github.com/NVlabs/Sana` の `sol-engine` ブランチ、Apache 2.0、2026-09-07 に調査）:
+  8×B300 向けの推論ランタイム。「few-step adapter」は T2V/I2V が `FastVideo/FastH3-4-step-Preview-v1-LoRA/dense-datafree`（= うちの `fast4`）、
+  Ref2VA が `lightx2v/Minimax-h3-Turbo/minimax_h3_ref2v_turbo_4step_v0.1`（= うちの `lora_ref`）で、新しい蒸留ではない。
+  目玉の Sol-Attn（query 依存のブロック疎アテンション、学習不要）は Ulysses の all-to-all 後に差し込む設計で、
+  エンジンが `world_size == 1` を **例外で拒否**する（"SOL attention requires 2, 4, or 8 GPU processes"）。README の 1 GPU ベンチ（124f 13.7 秒）は dense の数字。
+  カーネル単体には `sm120/`（CuTe DSL の JIT、nvcc 不要）と Triton 参照実装があるが **SM120 は未検証**、bf16 専用なので CK INT8 との併用ではなく置き換えになる。
+  ソースに「visual metric alone will rate it too highly」「dialogue fell apart」の注記があり、音声行をわざと dense に戻している。口パク用途では最も嫌な副作用。
+  それ以外（fused RMSNorm+RoPE・SwiGLU・AdaLN 事前計算で 24GB 節約）は ComfyUI 0.33 の `comfy/ldm/minimax/model.py` と pruned checkpoint の `[1025, 8]` テーブルが既に同じことをしている。
+  → 見送り。SM120 が検証され単一 GPU パスが出たら再評価
 
 ## 11. 運用で速くなったもの（★）
 
